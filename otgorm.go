@@ -2,11 +2,16 @@ package otgorm
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
+	"reflect"
+	"regexp"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/jinzhu/gorm"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 )
 
@@ -76,11 +81,14 @@ func (c *callbacks) after(scope *gorm.Scope, operation string) {
 		operation = strings.ToUpper(strings.Split(scope.SQL, " ")[0])
 	}
 	ext.Error.Set(sp, scope.HasError())
-	ext.DBStatement.Set(sp, scope.SQL)
+	ext.DBStatement.Set(sp, expandSQL(scope.SQL, scope.SQLVars))
 	sp.SetTag("db.table", scope.TableName())
 	sp.SetTag("db.method", operation)
 	sp.SetTag("db.err", scope.HasError())
 	sp.SetTag("db.count", scope.DB().RowsAffected)
+	if scope.DB().Error != nil {
+		sp.SetTag("message", scope.DB().Error.Error())
+	}
 	sp.Finish()
 }
 
@@ -106,4 +114,72 @@ func registerCallbacks(db *gorm.DB, name string, c *callbacks) {
 		db.Callback().RowQuery().Before(gormCallbackName).Register(beforeName, c.beforeRowQuery)
 		db.Callback().RowQuery().After(gormCallbackName).Register(afterName, c.afterRowQuery)
 	}
+}
+
+func isPrintable(s string) bool {
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	sqlRegexp                = regexp.MustCompile(`\?`)
+	numericPlaceHolderRegexp = regexp.MustCompile(`\$\d+`)
+)
+
+// Expand generic placeholder (?) to specific argument
+func expandSQL(sql string, sqlVars []interface{}) (sqlFinal string) {
+	var formattedValues []string
+	for _, value := range sqlVars {
+		indirectValue := reflect.Indirect(reflect.ValueOf(value))
+		if indirectValue.IsValid() {
+			value = indirectValue.Interface()
+			if t, ok := value.(time.Time); ok {
+				formattedValues = append(formattedValues, fmt.Sprintf("'%v'", t.Format("2006-01-02 15:04:05")))
+			} else if b, ok := value.([]byte); ok {
+				if str := string(b); isPrintable(str) {
+					formattedValues = append(formattedValues, fmt.Sprintf("'%v'", str))
+				} else {
+					formattedValues = append(formattedValues, "'<binary>'")
+				}
+			} else if r, ok := value.(driver.Valuer); ok {
+				if value, err := r.Value(); err == nil && value != nil {
+					formattedValues = append(formattedValues, fmt.Sprintf("'%v'", value))
+				} else {
+					formattedValues = append(formattedValues, "NULL")
+				}
+			} else {
+				switch value.(type) {
+				case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, bool:
+					formattedValues = append(formattedValues, fmt.Sprintf("%v", value))
+				default:
+					formattedValues = append(formattedValues, fmt.Sprintf("'%v'", value))
+				}
+			}
+		} else {
+			formattedValues = append(formattedValues, "NULL")
+		}
+	}
+
+	// differentiate between $n placeholders or else treat like ?
+	if numericPlaceHolderRegexp.MatchString(sql) {
+		sqlFinal = sql
+		for index, value := range formattedValues {
+			placeholder := fmt.Sprintf(`\$%d([^\d]|$)`, index+1)
+			sqlFinal = regexp.MustCompile(placeholder).ReplaceAllString(sqlFinal, value+"$1")
+		}
+	} else {
+		formattedValuesLength := len(formattedValues)
+		for index, value := range sqlRegexp.Split(sql, -1) {
+			sqlFinal += value
+			if index < formattedValuesLength {
+				sqlFinal += formattedValues[index]
+			}
+		}
+	}
+
+	return
 }
