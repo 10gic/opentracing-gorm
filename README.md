@@ -2,11 +2,9 @@
 
 [OpenTracing](http://opentracing.io/) instrumentation for [GORM](http://gorm.io/).
 
-## Install
+## Feature
 
-```
-go get -u github.com/smacker/opentracing-gorm
-```
+In tracing log, generic placeholder (?) in sql is expanded to specific argument.
 
 ## Usage
 
